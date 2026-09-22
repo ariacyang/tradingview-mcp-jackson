@@ -1,0 +1,139 @@
+//@version=6
+// =============================================================================
+// Expected Range Reversal ("IV Walls" approximation)
+// -----------------------------------------------------------------------------
+// A TradingView-only approximation of the "IV Walls" idea (expected daily range
+// from volatility, fade the extremes). Real IV walls need the live option chain;
+// Pine can't read that, so we approximate the expected move from price-based
+// volatility:
+//
+//   Expected move  = sigma_daily * mult          (HV method, ~1.65 sigma = 90%)
+//                  = kWall * ATR(daily)           (ATR method)
+//   Upper wall     = day open + expected move
+//   Lower wall     = day open - expected move
+//   Mid            = day open  (mean-reversion target)
+//
+// Trade idea (mean reversion): price tags a wall and closes back INSIDE it
+// -> fade it back toward the mid. Trend filter: once price CLOSES beyond a wall
+// this session, that side is "broken" and we stop fading it (trend-day guard).
+//
+// Anchored to the DAILY session, so it works on intraday charts. All daily
+// volatility reads use the PREVIOUS completed daily bar -> non-repainting.
+// =============================================================================
+
+indicator("Expected Range Reversal", shorttitle="ERR / IV Walls", overlay=true, max_labels_count=200)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpWall = "Expected Range (Walls)"
+method   = input.string("HV", "Range method", options=["HV", "ATR"], group=grpWall)
+sigMult  = input.float(1.65, "HV sigma multiple (1.65≈90%, 1.0≈68%)", minval=0.1, step=0.05, group=grpWall)
+hvLen    = input.int(20,   "HV lookback (daily bars)", minval=2, group=grpWall)
+kWall    = input.float(1.0, "ATR multiple", minval=0.1, step=0.1, group=grpWall)
+atrLen   = input.int(14,   "ATR length (daily bars)", minval=1, group=grpWall)
+showInner = input.bool(true, "Show inner 1σ band", group=grpWall)
+
+grpSig  = "Reversal Signals"
+needClose = input.bool(true, "Require close back inside wall (rejection)", group=grpSig)
+trendGuard = input.bool(true, "Trend-day guard (stop fading a broken wall)", group=grpSig)
+onePerSide = input.bool(true, "Max one reversal per side per session", group=grpSig)
+
+grpVis  = "Visuals"
+showMid  = input.bool(true, "Show mid line", group=grpVis)
+showLbl  = input.bool(true, "Show reversal labels", group=grpVis)
+shade    = input.bool(true, "Shade expected range", group=grpVis)
+
+// ---------------------------------------------------------------------------
+// Daily anchors (non-repainting: open is fixed at session start; vol uses [1])
+// ---------------------------------------------------------------------------
+dayOpen = request.security(syminfo.tickerid, "D", open, lookahead=barmerge.lookahead_on)
+
+atrD = request.security(syminfo.tickerid, "D", ta.atr(atrLen)[1], lookahead=barmerge.lookahead_on)
+sigD = request.security(syminfo.tickerid, "D", ta.stdev(math.log(close / close[1]), hvLen)[1], lookahead=barmerge.lookahead_on)
+
+// Expected move (price distance from the open to each wall).
+expMove = method == "ATR" ? kWall * atrD : dayOpen * sigD * sigMult
+inner1  = dayOpen * sigD * 1.0  // 1σ reference (HV basis) for the inner band
+
+upper = dayOpen + expMove
+lower = dayOpen - expMove
+mid   = dayOpen
+innerUp = dayOpen + inner1
+innerDn = dayOpen - inner1
+
+// ---------------------------------------------------------------------------
+// Session state
+// ---------------------------------------------------------------------------
+isNewSession = timeframe.change("D")
+
+var bool brokeUp   = false
+var bool brokeDn   = false
+var bool tookShort = false
+var bool tookLong  = false
+if isNewSession
+    brokeUp   := false
+    brokeDn   := false
+    tookShort := false
+    tookLong  := false
+
+// A wall is "broken" once a bar closes beyond it this session.
+if close > upper
+    brokeUp := true
+if close < lower
+    brokeDn := true
+
+// ---------------------------------------------------------------------------
+// Reversal signals
+//   Short: price tagged the upper wall and (optionally) closed back inside it.
+//   Long : price tagged the lower wall and (optionally) closed back inside it.
+// ---------------------------------------------------------------------------
+tagUpper = high >= upper
+tagLower = low  <= lower
+
+rejUpper = tagUpper and (not needClose or close < upper)
+rejLower = tagLower and (not needClose or close > lower)
+
+shortRaw = rejUpper and (not trendGuard or not brokeUp)
+longRaw  = rejLower and (not trendGuard or not brokeDn)
+
+shortSig = shortRaw and (not onePerSide or not tookShort)
+longSig  = longRaw  and (not onePerSide or not tookLong)
+
+if shortSig
+    tookShort := true
+if longSig
+    tookLong := true
+
+// ---------------------------------------------------------------------------
+// Plots
+// ---------------------------------------------------------------------------
+pU = plot(upper, "Upper Wall", color=color.new(color.red, 0),  linewidth=2)
+pL = plot(lower, "Lower Wall", color=color.new(color.green, 0), linewidth=2)
+plot(showMid ? mid : na, "Mid (Day Open)", color=color.new(color.gray, 0), style=plot.style_stepline)
+
+plot(showInner ? innerUp : na, "Inner +1σ", color=color.new(color.red, 55),   style=plot.style_stepline)
+plot(showInner ? innerDn : na, "Inner -1σ", color=color.new(color.green, 55), style=plot.style_stepline)
+
+fill(pU, pL, color=shade ? color.new(color.blue, 94) : na, title="Expected Range")
+
+// Wall-touch dots.
+plotshape(shortSig, title="Fade Short", location=location.abovebar, style=shape.triangledown,
+          color=color.new(color.red, 0),   size=size.tiny)
+plotshape(longSig,  title="Fade Long",  location=location.belowbar, style=shape.triangleup,
+          color=color.new(color.green, 0), size=size.tiny)
+
+if showLbl and shortSig
+    label.new(bar_index, high, "Fade ▼", yloc=yloc.abovebar, style=label.style_label_down,
+              color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+if showLbl and longSig
+    label.new(bar_index, low, "Fade ▲", yloc=yloc.belowbar, style=label.style_label_up,
+              color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+alertcondition(shortSig, title="Fade Short at Upper Wall", message="Price rejected UPPER IV wall on {{ticker}} @ {{close}} — fade short toward mid")
+alertcondition(longSig,  title="Fade Long at Lower Wall",  message="Price rejected LOWER IV wall on {{ticker}} @ {{close}} — fade long toward mid")
+alertcondition(close > upper, title="Upper Wall Broken", message="UPPER IV wall broken on {{ticker}} @ {{close}} — trend day risk")
+alertcondition(close < lower, title="Lower Wall Broken", message="LOWER IV wall broken on {{ticker}} @ {{close}} — trend day risk")

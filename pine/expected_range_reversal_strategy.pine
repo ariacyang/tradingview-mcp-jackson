@@ -1,0 +1,133 @@
+//@version=6
+// =============================================================================
+// Expected Range Reversal — Strategy ("IV Walls" approximation)
+// -----------------------------------------------------------------------------
+// Same expected-range engine as the indicator, wired into fade trades:
+//   ENTRY  : price tags a wall and closes back inside -> fade toward the mid.
+//   STOP   : just BEYOND the wall (wall +/- buffer*ATR) — the mean-reversion
+//            thesis is wrong once the wall is decisively broken.
+//   TARGET : the mid (day open) by default, or the opposite wall.
+//   FILTER : trend-day guard — stop fading a wall once a bar closes beyond it.
+//
+// NOTE: this is a price-volatility approximation of IV walls. Real option-chain
+// IV is not available in Pine, so treat backtest numbers as a study of the
+// mean-reversion structure, not the exact software in the reels.
+// =============================================================================
+
+strategy("Expected Range Reversal Strategy", shorttitle="ERR-S", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         initial_capital=10000, commission_type=strategy.commission.percent,
+         commission_value=0.05, slippage=2, pyramiding=0, calc_on_every_tick=false,
+         max_labels_count=200)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpWall = "Expected Range (Walls)"
+method   = input.string("HV", "Range method", options=["HV", "ATR"], group=grpWall)
+sigMult  = input.float(1.65, "HV sigma multiple (1.65≈90%, 1.0≈68%)", minval=0.1, step=0.05, group=grpWall)
+hvLen    = input.int(20,   "HV lookback (daily bars)", minval=2, group=grpWall)
+kWall    = input.float(1.0, "ATR multiple", minval=0.1, step=0.1, group=grpWall)
+atrLen   = input.int(14,   "ATR length (daily bars)", minval=1, group=grpWall)
+
+grpSig  = "Reversal Signals"
+needClose  = input.bool(true, "Require close back inside wall (rejection)", group=grpSig)
+trendGuard = input.bool(true, "Trend-day guard (stop fading a broken wall)", group=grpSig)
+onePerSide = input.bool(true, "Max one reversal per side per session", group=grpSig)
+
+grpRisk = "Risk / Exits"
+stopBufATR = input.float(0.5, "Stop buffer beyond wall (× intraday ATR)", minval=0.0, step=0.1, group=grpRisk)
+atrLenI    = input.int(14, "Intraday ATR length (for stop buffer)", minval=1, group=grpRisk)
+target     = input.string("Mid", "Target", options=["Mid", "Opposite wall"], group=grpRisk)
+exitEOD    = input.bool(true, "Close at session end (no overnight)", group=grpRisk)
+
+grpTime = "Trading Window"
+useWindow = input.bool(false, "Limit to date range", group=grpTime)
+startTime = input.time(timestamp("2020-01-01 00:00"), "Start", group=grpTime)
+endTime   = input.time(timestamp("2099-01-01 00:00"), "End",   group=grpTime)
+inWindow  = not useWindow or (time >= startTime and time <= endTime)
+
+// ---------------------------------------------------------------------------
+// Daily anchors (non-repainting)
+// ---------------------------------------------------------------------------
+dayOpen = request.security(syminfo.tickerid, "D", open, lookahead=barmerge.lookahead_on)
+atrD    = request.security(syminfo.tickerid, "D", ta.atr(atrLen)[1], lookahead=barmerge.lookahead_on)
+sigD    = request.security(syminfo.tickerid, "D", ta.stdev(math.log(close / close[1]), hvLen)[1], lookahead=barmerge.lookahead_on)
+
+expMove = method == "ATR" ? kWall * atrD : dayOpen * sigD * sigMult
+upper = dayOpen + expMove
+lower = dayOpen - expMove
+mid   = dayOpen
+
+atrI = ta.atr(atrLenI)  // intraday ATR for the stop buffer
+
+// ---------------------------------------------------------------------------
+// Session state
+// ---------------------------------------------------------------------------
+isNewSession = timeframe.change("D")
+var bool brokeUp   = false
+var bool brokeDn   = false
+var bool tookShort = false
+var bool tookLong  = false
+if isNewSession
+    brokeUp   := false
+    brokeDn   := false
+    tookShort := false
+    tookLong  := false
+if close > upper
+    brokeUp := true
+if close < lower
+    brokeDn := true
+
+// ---------------------------------------------------------------------------
+// Signals
+// ---------------------------------------------------------------------------
+tagUpper = high >= upper
+tagLower = low  <= lower
+rejUpper = tagUpper and (not needClose or close < upper)
+rejLower = tagLower and (not needClose or close > lower)
+
+shortRaw = rejUpper and (not trendGuard or not brokeUp) and inWindow
+longRaw  = rejLower and (not trendGuard or not brokeDn) and inWindow
+shortSig = shortRaw and (not onePerSide or not tookShort)
+longSig  = longRaw  and (not onePerSide or not tookLong)
+if shortSig
+    tookShort := true
+if longSig
+    tookLong := true
+
+// ---------------------------------------------------------------------------
+// Entries / exits
+// ---------------------------------------------------------------------------
+if shortSig
+    strategy.entry("Short", strategy.short)
+if longSig
+    strategy.entry("Long", strategy.long)
+
+shortStop = upper + stopBufATR * atrI
+longStop  = lower - stopBufATR * atrI
+shortTP   = target == "Opposite wall" ? lower : mid
+longTP    = target == "Opposite wall" ? upper : mid
+
+if strategy.position_size < 0
+    strategy.exit("S-Exit", from_entry="Short", stop=shortStop, limit=shortTP)
+if strategy.position_size > 0
+    strategy.exit("L-Exit", from_entry="Long", stop=longStop, limit=longTP)
+
+// Flat everything into the close so reversals don't carry overnight.
+if exitEOD and session.islastbar
+    strategy.close_all(comment="EOD")
+
+// ---------------------------------------------------------------------------
+// Plots
+// ---------------------------------------------------------------------------
+pU = plot(upper, "Upper Wall", color=color.new(color.red, 0),  linewidth=2)
+pL = plot(lower, "Lower Wall", color=color.new(color.green, 0), linewidth=2)
+plot(mid, "Mid (Day Open)", color=color.new(color.gray, 0), style=plot.style_stepline)
+fill(pU, pL, color=color.new(color.blue, 94), title="Expected Range")
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+alertcondition(shortSig, title="Fade Short at Upper Wall", message="Fade SHORT at upper IV wall on {{ticker}} @ {{close}}")
+alertcondition(longSig,  title="Fade Long at Lower Wall",  message="Fade LONG at lower IV wall on {{ticker}} @ {{close}}")
