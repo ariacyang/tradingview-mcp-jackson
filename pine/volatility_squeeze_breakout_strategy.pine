@@ -1,0 +1,147 @@
+//@version=6
+// =============================================================================
+// Volatility Squeeze Breakout — Strategy
+// -----------------------------------------------------------------------------
+// Same squeeze engine as the indicator, wired into entries/exits:
+//   1. SQUEEZE ON  : Bollinger Bands sit INSIDE the Keltner Channels.
+//   2. SQUEEZE FIRE: BB pushes back OUTSIDE KC -> the coil releases.
+//   3. DIRECTION   : linear-regression momentum decides long vs short.
+//   4. ENTRY       : on the fire bar, enter in the momentum direction.
+//   5. EXIT        : ATR stop-loss + ATR take-profit, optional opposite-signal
+//                    exit, optional re-squeeze exit.
+//
+// Position sizing, commission and slippage are set on the strategy() call so
+// the Strategy Tester numbers reflect realistic costs.
+// =============================================================================
+
+strategy("Volatility Squeeze Breakout Strategy", shorttitle="VSB-S", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         initial_capital=10000, commission_type=strategy.commission.percent,
+         commission_value=0.05, slippage=2, pyramiding=0, calc_on_every_tick=false,
+         max_labels_count=200)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpBB   = "Bollinger Bands"
+bbLen   = input.int(20,   "BB Length",      minval=1, group=grpBB)
+bbMult  = input.float(2.0,"BB StdDev Mult", minval=0.1, step=0.1, group=grpBB)
+bbSrc   = input.source(close, "BB Source",  group=grpBB)
+
+grpKC   = "Keltner Channels"
+kcLen   = input.int(20,   "KC Length",      minval=1, group=grpKC)
+kcMult  = input.float(1.5,"KC ATR Mult",    minval=0.1, step=0.1, group=grpKC)
+useTR   = input.bool(true,"Use True Range for KC width", group=grpKC)
+
+grpMom  = "Momentum / Direction"
+momLen  = input.int(20,   "Momentum Length",  minval=1, group=grpMom)
+reqMom  = input.bool(true,"Require momentum agreement on fire", group=grpMom)
+
+grpRisk = "Risk / Exits"
+atrLen   = input.int(14,   "ATR Length",       minval=1, group=grpRisk)
+slMult   = input.float(2.0,"Stop-Loss ATR Mult",   minval=0.1, step=0.1, group=grpRisk)
+tpMult   = input.float(3.0,"Take-Profit ATR Mult", minval=0.1, step=0.1, group=grpRisk)
+useStop  = input.bool(true, "Use ATR stop-loss",     group=grpRisk)
+useTP    = input.bool(true, "Use ATR take-profit",    group=grpRisk)
+exitOpp  = input.bool(true, "Exit on opposite signal", group=grpRisk)
+
+grpTime = "Trading Window"
+useWindow = input.bool(false, "Limit to date range", group=grpTime)
+startTime = input.time(timestamp("2020-01-01 00:00"), "Start", group=grpTime)
+endTime   = input.time(timestamp("2099-01-01 00:00"), "End",   group=grpTime)
+inWindow  = not useWindow or (time >= startTime and time <= endTime)
+
+// ---------------------------------------------------------------------------
+// Bollinger Bands
+// ---------------------------------------------------------------------------
+bbBasis = ta.sma(bbSrc, bbLen)
+bbDev   = bbMult * ta.stdev(bbSrc, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+// ---------------------------------------------------------------------------
+// Keltner Channels
+// ---------------------------------------------------------------------------
+kcBasis   = ta.sma(close, kcLen)
+kcRange   = useTR ? ta.tr(true) : (high - low)
+kcRangeMa = ta.sma(kcRange, kcLen)
+kcUpper   = kcBasis + kcMult * kcRangeMa
+kcLower   = kcBasis - kcMult * kcRangeMa
+
+// ---------------------------------------------------------------------------
+// Squeeze state
+// ---------------------------------------------------------------------------
+squeezeOn    = (bbLower > kcLower) and (bbUpper < kcUpper)
+squeezeOff   = not squeezeOn
+squeezeFired = squeezeOff and squeezeOn[1]
+
+// ---------------------------------------------------------------------------
+// Momentum (linear regression around a mid value) -> direction
+// ---------------------------------------------------------------------------
+highest  = ta.highest(high, momLen)
+lowest   = ta.lowest(low, momLen)
+midDC    = math.avg(math.avg(highest, lowest), ta.sma(close, momLen))
+momentum = ta.linreg(close - midDC, momLen, 0)
+momUp    = momentum > 0
+momDown  = momentum < 0
+
+// ---------------------------------------------------------------------------
+// Signals
+// ---------------------------------------------------------------------------
+longSignal  = squeezeFired and (not reqMom or momUp)   and inWindow
+shortSignal = squeezeFired and (not reqMom or momDown) and inWindow
+
+// ---------------------------------------------------------------------------
+// Entries
+// ---------------------------------------------------------------------------
+if longSignal
+    strategy.entry("Long", strategy.long)
+
+if shortSignal
+    strategy.entry("Short", strategy.short)
+
+// ---------------------------------------------------------------------------
+// Exits: ATR-based stop-loss / take-profit anchored to entry price
+// ---------------------------------------------------------------------------
+atr = ta.atr(atrLen)
+
+longStop  = strategy.position_avg_price - slMult * atr
+longTP    = strategy.position_avg_price + tpMult * atr
+shortStop = strategy.position_avg_price + slMult * atr
+shortTP   = strategy.position_avg_price - tpMult * atr
+
+if strategy.position_size > 0
+    strategy.exit("L-Exit", from_entry="Long",
+                  stop  = useStop ? longStop : na,
+                  limit = useTP   ? longTP   : na)
+
+if strategy.position_size < 0
+    strategy.exit("S-Exit", from_entry="Short",
+                  stop  = useStop ? shortStop : na,
+                  limit = useTP   ? shortTP   : na)
+
+// Optional: close on an opposite squeeze-breakout signal.
+if exitOpp and strategy.position_size > 0 and shortSignal
+    strategy.close("Long", comment="Opp signal")
+if exitOpp and strategy.position_size < 0 and longSignal
+    strategy.close("Short", comment="Opp signal")
+
+// ---------------------------------------------------------------------------
+// Visuals (mirror the indicator so the chart stays readable)
+// ---------------------------------------------------------------------------
+plot(bbBasis, "BB Basis", color=color.new(color.orange, 40))
+pBBu = plot(bbUpper, "BB Upper", color=color.new(color.orange, 20))
+pBBl = plot(bbLower, "BB Lower", color=color.new(color.orange, 20))
+fill(pBBu, pBBl, color=color.new(color.orange, 92), title="BB Fill")
+plot(kcUpper, "KC Upper", color=color.new(color.blue, 30))
+plot(kcLower, "KC Lower", color=color.new(color.blue, 30))
+
+dotColor = squeezeOn ? color.new(color.gray, 0) : squeezeFired ? color.new(color.lime, 0) : na
+plot(bbBasis, "Squeeze Dot", color=dotColor, style=plot.style_circles, linewidth=2)
+bgcolor(squeezeOn ? color.new(color.gray, 88) : na, title="Squeeze Zone")
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+alertcondition(longSignal,  title="Squeeze Breakout LONG",  message="Squeeze breakout LONG on {{ticker}} @ {{close}}")
+alertcondition(shortSignal, title="Squeeze Breakout SHORT", message="Squeeze breakout SHORT on {{ticker}} @ {{close}}")
