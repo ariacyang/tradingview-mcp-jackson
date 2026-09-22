@@ -1,0 +1,131 @@
+//@version=6
+// =============================================================================
+// Volatility Squeeze Breakout
+// -----------------------------------------------------------------------------
+// Logic (classic TTM-style squeeze, John Carter):
+//   1. SQUEEZE ON  : Bollinger Bands sit INSIDE the Keltner Channels.
+//                    -> volatility is compressed, the market is coiling.
+//   2. SQUEEZE FIRE: Bollinger Bands push BACK OUTSIDE the Keltner Channels.
+//                    -> the coil releases; a directional move is starting.
+//   3. DIRECTION   : a linear-regression momentum value decides long vs short
+//                    so we don't chase a squeeze release into thin air.
+//   4. SIGNAL      : on the fire bar, momentum sign -> BUY / SELL label.
+//
+// Overlay indicator: plots BB + KC, shades active squeezes, and marks the
+// breakout bar. A momentum-histogram version can live in a lower pane, but
+// this stays on price so the entries are readable next to the candles.
+// =============================================================================
+
+indicator("Volatility Squeeze Breakout", shorttitle="VSB", overlay=true, max_labels_count=200)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpBB   = "Bollinger Bands"
+bbLen   = input.int(20,   "BB Length",        minval=1, group=grpBB)
+bbMult  = input.float(2.0,"BB StdDev Mult",   minval=0.1, step=0.1, group=grpBB)
+bbSrc   = input.source(close, "BB Source",    group=grpBB)
+
+grpKC   = "Keltner Channels"
+kcLen   = input.int(20,   "KC Length",        minval=1, group=grpKC)
+kcMult  = input.float(1.5,"KC ATR Mult",      minval=0.1, step=0.1, group=grpKC)
+useTR   = input.bool(true,"Use True Range for KC width", group=grpKC)
+
+grpMom  = "Momentum / Direction"
+momLen  = input.int(20,   "Momentum Length",  minval=1, group=grpMom)
+reqMom  = input.bool(true,"Require momentum agreement on fire", group=grpMom)
+
+grpVis  = "Visuals & Alerts"
+showBB   = input.bool(true, "Show Bollinger Bands", group=grpVis)
+showKC   = input.bool(true, "Show Keltner Channels", group=grpVis)
+shadeSqz = input.bool(true, "Shade squeeze zones",  group=grpVis)
+showSig  = input.bool(true, "Show BUY/SELL labels",  group=grpVis)
+
+// ---------------------------------------------------------------------------
+// Bollinger Bands
+// ---------------------------------------------------------------------------
+bbBasis = ta.sma(bbSrc, bbLen)
+bbDev   = bbMult * ta.stdev(bbSrc, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+// ---------------------------------------------------------------------------
+// Keltner Channels
+// ---------------------------------------------------------------------------
+kcBasis = ta.sma(close, kcLen)
+kcRange = useTR ? ta.tr(true) : (high - low)
+kcRangeMa = ta.sma(kcRange, kcLen)
+kcUpper = kcBasis + kcMult * kcRangeMa
+kcLower = kcBasis - kcMult * kcRangeMa
+
+// ---------------------------------------------------------------------------
+// Squeeze state
+//   ON when both Bollinger bands are contained within the Keltner channels.
+// ---------------------------------------------------------------------------
+squeezeOn  = (bbLower > kcLower) and (bbUpper < kcUpper)
+squeezeOff = not squeezeOn
+
+// The "fire" bar: first bar where a squeeze that was ON turns OFF.
+squeezeFired = squeezeOff and squeezeOn[1]
+
+// ---------------------------------------------------------------------------
+// Momentum (linear-regression of price around a mid value) -> direction.
+// Mirrors the TTM squeeze momentum: value above 0 = bullish pressure.
+// ---------------------------------------------------------------------------
+highest = ta.highest(high, momLen)
+lowest  = ta.lowest(low, momLen)
+midDC   = math.avg(math.avg(highest, lowest), ta.sma(close, momLen))
+momentum = ta.linreg(close - midDC, momLen, 0)
+
+momUp   = momentum > 0
+momDown = momentum < 0
+
+// ---------------------------------------------------------------------------
+// Breakout signals
+//   Long  : squeeze fires while momentum is up (or momentum filter off).
+//   Short : squeeze fires while momentum is down.
+// ---------------------------------------------------------------------------
+longSignal  = squeezeFired and (not reqMom or momUp)
+shortSignal = squeezeFired and (not reqMom or momDown)
+
+// ---------------------------------------------------------------------------
+// Plots
+// ---------------------------------------------------------------------------
+pBBb = plot(showBB ? bbBasis : na, "BB Basis", color=color.new(color.orange, 40))
+pBBu = plot(showBB ? bbUpper : na, "BB Upper", color=color.new(color.orange, 20))
+pBBl = plot(showBB ? bbLower : na, "BB Lower", color=color.new(color.orange, 20))
+fill(pBBu, pBBl, color=showBB ? color.new(color.orange, 92) : na, title="BB Fill")
+
+plot(showKC ? kcUpper : na, "KC Upper", color=color.new(color.blue, 30), style=plot.style_line)
+plot(showKC ? kcLower : na, "KC Lower", color=color.new(color.blue, 30), style=plot.style_line)
+
+// Squeeze marker dots on the basis line: gray = squeeze on, green = fired.
+dotColor = squeezeOn ? color.new(color.gray, 0) : squeezeFired ? color.new(color.lime, 0) : na
+plot(shadeSqz ? bbBasis : na, "Squeeze Dot", color=dotColor, style=plot.style_circles, linewidth=2)
+
+// Background shading while a squeeze is active.
+bgcolor(shadeSqz and squeezeOn ? color.new(color.gray, 88) : na, title="Squeeze Zone")
+
+// ---------------------------------------------------------------------------
+// Signal labels
+// ---------------------------------------------------------------------------
+if showSig and longSignal
+    label.new(bar_index, low, "BUY", yloc=yloc.belowbar, style=label.style_label_up,
+              color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+
+if showSig and shortSignal
+    label.new(bar_index, high, "SELL", yloc=yloc.abovebar, style=label.style_label_down,
+              color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+
+// Shape markers (always drawn, independent of labels) for backtest visibility.
+plotshape(longSignal,  title="Long Fire",  location=location.belowbar,
+          style=shape.triangleup,   color=color.new(color.green, 0), size=size.tiny)
+plotshape(shortSignal, title="Short Fire", location=location.abovebar,
+          style=shape.triangledown, color=color.new(color.red, 0),   size=size.tiny)
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+alertcondition(squeezeFired, title="Squeeze Fired", message="Volatility squeeze released on {{ticker}} @ {{close}}")
+alertcondition(longSignal,   title="Squeeze Breakout LONG",  message="Squeeze breakout LONG on {{ticker}} @ {{close}}")
+alertcondition(shortSignal,  title="Squeeze Breakout SHORT", message="Squeeze breakout SHORT on {{ticker}} @ {{close}}")
